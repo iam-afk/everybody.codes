@@ -1,0 +1,8 @@
+.*
+!.gitignore
+
+__pycache__/
+
+uv.lock
+
+*.[123].in
