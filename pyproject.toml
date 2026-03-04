@@ -1,0 +1,7 @@
+[project]
+name = "everybode.codes"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "sympy>=1.14.0",
+]
