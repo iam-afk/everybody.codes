@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="GradleMigrationSettings" migrationVersion="1" />
+  <component name="GradleSettings">
+    <option name="linkedExternalProjectsSettings">
+      <GradleProjectSettings>
+        <compositeConfiguration>
+          <compositeBuild compositeDefinitionSource="SCRIPT">
+            <builds>
+              <build path="$PROJECT_DIR$/gradle/everybody-codes-plugin" name="everybody-codes-plugin">
+                <projects>
+                  <project path="$PROJECT_DIR$/gradle/everybody-codes-plugin" />
+                  <project path="$PROJECT_DIR$/gradle/everybody-codes-plugin/plugin" />
+                </projects>
+              </build>
+            </builds>
+          </compositeBuild>
+        </compositeConfiguration>
+        <option name="externalProjectPath" value="$PROJECT_DIR$" />
+        <option name="modules">
+          <set>
+            <option value="$PROJECT_DIR$" />
+            <option value="$PROJECT_DIR$/events" />
+            <option value="$PROJECT_DIR$/events/2026" />
+            <option value="$PROJECT_DIR$/events/2026/10" />
+            <option value="$PROJECT_DIR$/events/2026/7" />
+            <option value="$PROJECT_DIR$/events/2026/8" />
+            <option value="$PROJECT_DIR$/events/2026/9" />
+            <option value="$PROJECT_DIR$/gradle/everybody-codes-plugin" />
+            <option value="$PROJECT_DIR$/gradle/everybody-codes-plugin/plugin" />
+          </set>
+        </option>
+      </GradleProjectSettings>
+    </option>
+  </component>
+</project>
