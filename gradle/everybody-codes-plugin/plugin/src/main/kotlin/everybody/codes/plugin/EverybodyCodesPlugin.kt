@@ -1,34 +1,44 @@
 package everybody.codes.plugin
 
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
 import org.gradle.api.*
 import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.file.RegularFile
 import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.provider.ListProperty
 import org.gradle.api.provider.Property
+import org.gradle.api.provider.Provider
 import org.gradle.api.services.BuildService
 import org.gradle.api.services.BuildServiceParameters
 import org.gradle.api.services.ServiceReference
 import org.gradle.api.tasks.*
+import org.gradle.process.CommandLineArgumentProvider
 import org.jetbrains.kotlin.gradle.dsl.jvm.JvmTargetValidationMode
 import org.jetbrains.kotlin.gradle.plugin.KotlinPluginWrapper
 import org.jetbrains.kotlin.gradle.plugin.KotlinSourceSetContainer
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
+import java.io.File
 import java.io.IOException
 import java.net.*
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.StandardOpenOption
+import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.time.Duration
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import kotlin.time.Duration.Companion.milliseconds
 
 interface Parameters : BuildServiceParameters {
-    val cookie: Property<String>
+    val cookieFile: RegularFileProperty
 }
 
 @Serializable
@@ -66,18 +76,55 @@ data class Verdict(
     val penaltyLeftMs: Long?
 )
 
+internal fun Verdict.formatResult(): String {
+    if (correct) return "correct!"
+
+    val hints = listOfNotNull(
+        lengthCorrect?.let { if (it) "length correct" else "length wrong" },
+        firstCorrect?.let { if (it) "first character correct" else "first character wrong" }
+    )
+    return buildString {
+        append("WRONG ANSWER")
+        if (hints.isNotEmpty()) append("\n${hints.joinToString(", ")}")
+        if (penaltyLeftMs != null && penaltyLeftMs > 0) {
+            append("\nRetry in ${penaltyLeftMs.milliseconds}.")
+        } else if (penaltyLeftMs == null && penaltyUntil != null && penaltyUntil > 0) {
+            append("\nCooldown until: $penaltyUntil (server timestamp)")
+        }
+    }
+}
+
 val json = Json {
     ignoreUnknownKeys = true
     explicitNulls = false
 }
 
+@OptIn(ExperimentalSerializationApi::class)
+internal inline fun <reified T> HttpClient.downloadJson(uri: URI, output: Path) {
+    val staged = Files.createTempFile(output.toAbsolutePath().parent, ".${output.fileName}.", ".tmp")
+    try {
+        val response = send(HttpRequest.newBuilder(uri).build(), HttpResponse.BodyHandlers.ofFile(staged))
+        if (response.statusCode() !in 200..299) {
+            throw GradleException("Failed to download ${output.fileName}: HTTP ${response.statusCode()}")
+        }
+        try {
+            Files.newInputStream(staged).use { json.decodeFromStream<T>(it) }
+        } catch (_: SerializationException) {
+            throw GradleException("Invalid JSON response for ${output.fileName}")
+        }
+        Files.move(staged, output, ATOMIC_MOVE, REPLACE_EXISTING)
+    } finally {
+        Files.deleteIfExists(staged)
+    }
+}
+
 abstract class ApiService : BuildService<Parameters>, AutoCloseable {
     private val client: HttpClient
-    private val user: User
+    val seed: Long
 
     init {
         val cookieManager = CookieManager(null, CookiePolicy.ACCEPT_NONE).apply {
-            val cookie = HttpCookie("everybody-codes", parameters.cookie.get()).apply {
+            val cookie = HttpCookie("everybody-codes", readCookie(parameters.cookieFile.get().asFile)).apply {
                 domain = "api.everybody.codes"
                 path = "/"
                 version = 0
@@ -94,28 +141,18 @@ abstract class ApiService : BuildService<Parameters>, AutoCloseable {
         val response = client.send(request, HttpResponse.BodyHandlers.ofString())
         if (response.statusCode() !in 200..299)
             throw RuntimeException("failed to fetch seed")
-        user = json.decodeFromString<User>(response.body())
+        seed = json.decodeFromString<User>(response.body()).seed
     }
 
-    fun fetchNotes(event: String, quest: String, output: Path) {
-        val response = client.send(
-            HttpRequest.newBuilder(URI("https://everybody.codes/assets/$event/$quest/input/${user.seed}.json")).build(),
-            HttpResponse.BodyHandlers.ofFile(output)
+    fun fetchNotes(event: String, quest: String, seed: Long, output: Path) {
+        client.downloadJson<Map<String, String>>(
+            URI("https://everybody.codes/assets/$event/$quest/input/$seed.json"),
+            output
         )
-        if (response.statusCode() !in 200..299)
-            throw RuntimeException("failed to downloads notes")
     }
 
     fun state(event: String, quest: String, output: Path) {
-        val response = client.send(
-            HttpRequest.newBuilder(URI("https://api.everybody.codes/event/$event/quest/$quest")).build(),
-            HttpResponse.BodyHandlers.ofFile(
-                output, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING,
-                StandardOpenOption.CREATE
-            )
-        )
-        if (response.statusCode() !in 200..299)
-            throw RuntimeException("failed to fetch keys")
+        client.downloadJson<Status>(URI("https://api.everybody.codes/event/$event/quest/$quest"), output)
     }
 
     fun submit(event: String, quest: String, part: String, answer: String): Verdict {
@@ -150,16 +187,20 @@ abstract class DownloadNotes : DefaultTask() {
     @get:Input
     abstract val quest: Property<String>
 
+    @get:Input
+    abstract val seed: Property<Long>
+
     @get:OutputFile
     abstract val notesFile: RegularFileProperty
 
     @TaskAction
     fun download() {
-        api.get().fetchNotes(event.get(), quest.get(), notesFile.get().asFile.toPath())
+        api.get().fetchNotes(event.get(), quest.get(), seed.get(), notesFile.get().asFile.toPath())
     }
 
 }
 
+@UntrackedTask(because = "Quest state can change on the website between builds")
 abstract class DownloadState : DefaultTask() {
 
     @get:ServiceReference("api")
@@ -181,6 +222,14 @@ abstract class DownloadState : DefaultTask() {
 
 }
 
+class PartArguments(
+    // Locked parts have a path but no file, so use InputFiles rather than InputFile.
+    @get:InputFiles @get:PathSensitive(PathSensitivity.NONE) val notes: Provider<RegularFile>,
+    @get:Internal val answer: Provider<RegularFile>
+) : CommandLineArgumentProvider {
+    override fun asArguments() = listOf(notes.get().asFile.absolutePath, answer.get().asFile.absolutePath)
+}
+
 class EverybodyCodesPlugin : Plugin<Project> {
     override fun apply(project: Project) {
         project.pluginManager.apply(KotlinPluginWrapper::class.java)
@@ -188,13 +237,14 @@ class EverybodyCodesPlugin : Plugin<Project> {
             it.jvmTargetValidationMode.set(JvmTargetValidationMode.IGNORE)
         }
 
-        project.gradle.sharedServices.registerIfAbsent("api", ApiService::class.java) { spec ->
-            spec.parameters.cookie.set(project.readCookie())
+        val api = project.gradle.sharedServices.registerIfAbsent("api", ApiService::class.java) { spec ->
+            spec.parameters.cookieFile.set(project.layout.settingsDirectory.file(".everybody-codes"))
         }
 
         val downloadNotes = project.tasks.register("downloadNotes", DownloadNotes::class.java) { task ->
             task.event.set(project.parent!!.name)
             task.quest.set(project.name)
+            task.seed.set(api.map { it.seed })
             task.notesFile.set(project.layout.buildDirectory.file("everybody_codes/notes.json"))
         }
 
@@ -204,12 +254,16 @@ class EverybodyCodesPlugin : Plugin<Project> {
             task.stateFile.set(project.layout.buildDirectory.file("everybody_codes/state.json"))
         }
 
-        val (notes1, notes2, notes3) = (1..3).map { part ->
-            project.tasks.register("decryptNotes$part", DecryptNotes::class.java) { task ->
+        val parts = (1..3).map { part ->
+            val decrypted = project.layout.buildDirectory.file("everybody_codes/notes$part.txt")
+            val answer = project.layout.buildDirectory.file("everybody_codes/answer$part.txt")
+            val decrypt = project.tasks.register("decryptNotes$part", DecryptNotes::class.java) { task ->
                 task.part.set(part.toString())
                 task.notesFile.set(downloadNotes.flatMap { it.notesFile })
                 task.statusFile.set(downloadState.flatMap { it.stateFile })
+                task.decryptedNotes.set(decrypted)
             }
+            PartArguments(decrypt.flatMap { it.decryptedNotes }, answer)
         }
 
         val generateMain = project.tasks.register("generateMain", GenerateMain::class.java) { task ->
@@ -221,41 +275,31 @@ class EverybodyCodesPlugin : Plugin<Project> {
         sourceSetMain.kotlin.setSrcDirs(listOf(project.layout.projectDirectory))
         sourceSetMain.generatedKotlin.srcDir(generateMain)
 
-        val (answer1, answer2, answer3) = (1..3).map {
-            project.layout.buildDirectory.file("everybody_codes/answer$it.txt")
-        }
-
         val run = project.tasks.register("run", JavaExec::class.java) { task ->
-            task.dependsOn(notes1, notes2, notes3)
             task.classpath = project.files(
                 project.extensions.getByType(SourceSetContainer::class.java).getByName("main").runtimeClasspath
             )
             task.mainClass.set("MainKt")
-            task.doFirst {
-                task.args(notes1.flatMap { it.decryptedNotes }.map { it.asFile.absolutePath }.get())
-                task.args(answer1.get().asFile.absolutePath)
-                task.args(notes2.flatMap { it.decryptedNotes }.map { it.asFile.absolutePath }.get())
-                task.args(answer2.get().asFile.absolutePath)
-                task.args(notes3.flatMap { it.decryptedNotes }.map { it.asFile.absolutePath }.get())
-                task.args(answer3.get().asFile.absolutePath)
-            }
-            task.outputs.files(answer1, answer2, answer3)
+            task.argumentProviders.addAll(parts)
+            task.outputs.files(parts.map { it.answer })
         }
 
         project.tasks.register("submit", Submit::class.java) { task ->
             task.dependsOn(run)
-            task.inputs.files(answer1, answer2, answer3)
+            parts.forEach { task.answerFiles.add(it.answer) }
             task.statusFile.set(downloadState.flatMap { it.stateFile })
         }
     }
 }
 
-fun Project.readCookie(): String {
-    val file = project.layout.settingsDirectory.file(".everybody-codes").asFile
+private fun readCookie(file: File): String {
     val cookie = try {
         file.readText().trim()
     } catch (e: IOException) {
-        throw ProjectConfigurationException("cannot read `${file.name}` in project root directory", e)
+        throw GradleException(
+            "Cannot read `${file.name}` in the project root. API tasks require a session cookie in that file.",
+            e
+        )
     }
     if (cookie.isEmpty()) {
         throw GradleException("no session cookie in `${file.name}`")
@@ -292,12 +336,16 @@ abstract class DecryptNotes : DefaultTask() {
     abstract val part: Property<String>
 
     @get:OutputFile
-    val decryptedNotes = part.flatMap { project.layout.buildDirectory.file("everybody_codes/notes$it.txt") }
+    abstract val decryptedNotes: RegularFileProperty
 
     @TaskAction
     fun decryptNotes() {
         val part = part.get()
-        val key = status.get().key(part) ?: throw StopExecutionException()
+        val key = status.get().key(part)
+        if (key == null) {
+            Files.deleteIfExists(decryptedNotes.get().asFile.toPath())
+            return
+        }
         val notes = notesFile.get().asFile.inputStream().use {
             json.decodeFromStream<Map<String, String>>(it)
         }
@@ -317,37 +365,25 @@ abstract class GenerateMain : DefaultTask() {
         outputDir.get().file("Main.kt").asFile.writeText(
             $$"""
             import java.io.File
+            import java.nio.file.Files
             import kotlin.time.measureTimedValue
-            
+
             fun main(args: Array<String>) {
-                val (part1, part2, part3) = args.map(::File).chunked(2)
-                val (input1, answer1) = part1
-                if (input1.exists()) {
-                    val notes = input1.readText()
-                    val (answer, duration) = measureTimedValue {
-                        part1(notes)
+                val parts = args.map(::File).chunked(2)
+                fun runPart(part: Int, solve: (String) -> Any?) {
+                    val (input, output) = parts[part - 1]
+                    if (!input.exists()) {
+                        Files.deleteIfExists(output.toPath())
+                        return
                     }
-                    println("1: $answer\t($duration)")
-                    answer1.writeText("$answer")
+                    val notes = input.readText()
+                    val (answer, duration) = measureTimedValue { solve(notes) }
+                    println("$part: $answer\t($duration)")
+                    output.writeText("$answer")
                 }
-                val (input2, answer2) = part2
-                if (input2.exists()) {
-                    val notes = input2.readText()
-                    val (answer, duration) = measureTimedValue {
-                        part2(notes)
-                    }
-                    println("2: $answer\t($duration)")
-                    answer2.writeText("$answer")
-                }
-                val (input3, answer3) = part3
-                if (input3.exists()) {
-                    val notes = input3.readText()
-                    val (answer, duration) = measureTimedValue {
-                        part3(notes)
-                    }
-                    println("3: $answer\t($duration)")
-                    answer3.writeText("$answer")
-                }
+                runPart(1) { part1(it) }
+                runPart(2) { part2(it) }
+                runPart(3) { part3(it) }
             }
             """.trimIndent()
         )
@@ -368,40 +404,25 @@ abstract class Submit : DefaultTask() {
     @get:InputFile
     abstract val statusFile: RegularFileProperty
 
-    @get:Internal
-    val status = statusFile.map { file ->
-        val value = file.asFile.readText()
-        json.decodeFromString<Status>(value)
-    }
-
-    @get:Internal
-    val part = status.map {
-        if (it.answer1 == null) "1"
-        else if (it.answer2 == null) "2"
-        else if (it.answer3 == null) "3"
-        else null
-    }
-
-    @get:Internal
-    val answerFile = part.flatMap { project.layout.buildDirectory.file("everybody_codes/answer$it.txt") }
+    @get:InputFiles
+    abstract val answerFiles: ListProperty<RegularFile>
 
     @TaskAction
     fun submit() {
-        val part = part.getOrNull() ?: throw StopExecutionException("nothing to submit")
-        val answerFile = answerFile.get().asFile
+        val status = json.decodeFromString<Status>(statusFile.get().asFile.readText())
+        val part = when {
+            status.answer1 == null -> 1
+            status.answer2 == null -> 2
+            status.answer3 == null -> 3
+            else -> throw StopExecutionException("nothing to submit")
+        }
+        if (status.key(part.toString()) == null) throw StopExecutionException("part $part is locked")
+        val answerFile = answerFiles.get()[part - 1].asFile
         if (!answerFile.exists())
             throw StopExecutionException("no answer found for part $part")
         val answer = answerFile.readText()
         print("part $part: submitting $answer... ")
-        val verdict = api.get().submit(event, quest, part, answer)
-        if (verdict.correct) {
-            println("correct!")
-            statusFile.asFile.get().delete()
-        } else {
-            println("WRONG ANSWER")
-            println(
-                "length ${if (verdict.lengthCorrect!!) "correct" else "wrong"}, first character ${if (verdict.firstCorrect!!) "correct" else "wrong"}"
-            )
-        }
+        val verdict = api.get().submit(event, quest, part.toString(), answer)
+        println(verdict.formatResult())
     }
 }
