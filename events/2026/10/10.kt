@@ -1,5 +1,3 @@
-@file:OptIn(ExperimentalStdlibApi::class)
-
 fun main() {
     println(
         part1(
@@ -66,152 +64,117 @@ fun main() {
     )
 }
 
-data class P(val row: Int, val col: Int) {
-    operator fun plus(d: D) = P(row + d.dr, col + d.dc)
-}
+private class Cave(notes: String, allowance: Long) {
+    // Each state packs the cell index and two direction bits (up, right, down, left).
+    private val move: IntArray
+    private val occupancy: IntArray
+    private val state: IntArray
+    private val remaining: LongArray
+    private var alive: Int
 
-data class D(val dr: Int, val dc: Int) {
-    fun turn90() = D(dc, -dr)
-    fun turn180() = D(-dr, -dc)
-}
-
-data class Ghost(var p: P, var d: D, var c: Long = 0) {
-    fun move(): P = p + d
-}
-
-operator fun List<String>.get(p: P): Char = this[p.row][p.col]
-
-fun parseGhosts(map: List<String>) = buildList {
-    for (row in map.indices) {
-        for (col in map[row].indices) {
-            when (map[row][col]) {
-                '>' -> add(Ghost(P(row, col), D(0, 1)))
-                'v' -> add(Ghost(P(row, col), D(1, 0)))
-                '<' -> add(Ghost(P(row, col), D(0, -1)))
-                '^' -> add(Ghost(P(row, col), D(-1, 0)))
+    init {
+        val rows = notes.trimEnd().lines()
+        val width = rows.first().length
+        val cells = rows.joinToString("")
+        val directions = "^>v<"
+        val offsets = intArrayOf(-width, 1, width, -1)
+        move = IntArray(cells.length * 4)
+        occupancy = IntArray(cells.length)
+        state = IntArray(cells.count { it in directions })
+        remaining = LongArray(state.size) { allowance }
+        alive = 0
+        for (cell in cells.indices) {
+            if (cells[cell] == '#') continue
+            for (dir in offsets.indices) {
+                val next = cell + offsets[dir]
+                move[4 * cell + dir] = if (cells[next] == '#') {
+                    4 * cell + (dir + 1) % 4
+                } else {
+                    4 * next + dir
+                }
             }
+            val dir = directions.indexOf(cells[cell])
+            if (dir >= 0 && allowance > 0) state[alive++] = 4 * cell + dir
         }
+    }
+
+    fun step(): Int {
+        var hits = 0
+        occupancy.fill(0)
+        for (i in 0 until alive) {
+            val old = state[i]
+            val next = move[old]
+            state[i] = next
+            if (old / 4 == next / 4) {
+                hits++
+                if (--remaining[i] == 0L) continue // Gone before ghosts on this cell collide.
+            }
+            occupancy[next / 4]++
+        }
+
+        var survivors = 0
+        for (i in 0 until alive) {
+            if (remaining[i] == 0L) continue
+            var next = state[i]
+            if (occupancy[next / 4] > 1) {
+                hits++
+                if (--remaining[i] == 0L) continue
+                next = next xor 2
+            }
+            state[survivors] = next
+            remaining[survivors++] = remaining[i]
+        }
+        alive = survivors
+        return hits
+    }
+
+    fun lastRound(): Long {
+        val savedState = state.copyOf()
+        val savedRemaining = remaining.copyOf()
+        var savedRound = 0L
+        var window = 1L
+        var round = 0L
+        var skipped = false
+        while (alive > 0) {
+            val previousAlive = alive
+            step()
+            round++
+            if (alive != previousAlive) {
+                // A disappearance changes the dynamics and the indices of the survivors.
+                window = 1L
+                skipped = false
+            } else {
+                if (skipped) continue
+                val period = round - savedRound
+                if ((0 until alive).all { state[it] == savedState[it] }) {
+                    var cycles = Long.MAX_VALUE
+                    for (i in 0 until alive) {
+                        val loss = savedRemaining[i] - remaining[i]
+                        if (loss > 0) cycles = minOf(cycles, (remaining[i] - 1) / loss)
+                    }
+                    // Leave every ghost alive: play out the first death in round order.
+                    round += cycles * period
+                    for (i in 0 until alive) remaining[i] -= cycles * (savedRemaining[i] - remaining[i])
+                    skipped = true
+                    continue
+                }
+                // Doubling the checkpoint interval detects a cycle without keeping its history.
+                if (period < window) continue
+                window *= 2
+            }
+            savedRound = round
+            state.copyInto(savedState, endIndex = alive)
+            remaining.copyInto(savedRemaining, endIndex = alive)
+        }
+        return round
     }
 }
 
 fun part1(notes: String): Int {
-    val map = notes.lines()
-    val ghosts = parseGhosts(map)
-
-    var collisions = 0
-    repeat(10) {
-        val after = buildMap {
-            for (g in ghosts) {
-                val n = g.move()
-                if (map[n] == '#') {
-                    g.d = g.d.turn90()
-                    getOrPutIfMissing(g.p) { mutableListOf() }.add(g)
-                    collisions += 1
-                } else {
-                    g.p = n
-                    getOrPutIfMissing(g.p) { mutableListOf() }.add(g)
-                }
-            }
-        }
-        for ((_, ghosts) in after.filter { (_, ghosts) -> ghosts.size > 1 }) {
-            for (g in ghosts) {
-                g.d = g.d.turn180()
-                collisions += 1
-            }
-        }
-    }
-
-    return collisions
+    val cave = Cave(notes, Long.MAX_VALUE)
+    return (1..10).sumOf { cave.step() }
 }
 
-fun part2(notes: String, disappear: Int = 10_000): Int {
-    val map = notes.lines()
-    val ghosts = parseGhosts(map)
+fun part2(notes: String, disappear: Int = 10_000): Int = Cave(notes, disappear.toLong()).lastRound().toInt()
 
-    var round = 0
-    while (ghosts.any { it.c < disappear }) {
-        val after = buildMap {
-            for (g in ghosts.filter { it.c < disappear }) {
-                val n = g.move()
-                if (map[n] == '#') {
-                    g.d = g.d.turn90()
-                    g.c += 1
-                    if (g.c < disappear) {
-                        getOrPutIfMissing(g.p) { mutableListOf() }.add(g)
-                    }
-                } else {
-                    g.p = n
-                    getOrPutIfMissing(g.p) { mutableListOf() }.add(g)
-                }
-            }
-        }
-        for ((_, ghosts) in after.filter { (_, ghosts) -> ghosts.size > 1 }) {
-            for (g in ghosts) {
-                g.d = g.d.turn180()
-                g.c += 1
-            }
-        }
-        round += 1
-    }
-
-    return round
-}
-
-fun part3(notes: String, disappear: Long = 1_000_000_000_000): Long {
-    val map = notes.lines()
-    val ghosts = parseGhosts(map)
-
-    fun alive() = ghosts.filter { it.c < disappear }
-    fun state() = alive().map { it.copy(c = 0) }
-
-    data class S(val round: Long, val collisions: List<Long>)
-
-    val states = mutableMapOf<List<Ghost>, S>()
-
-    var round = 0L
-    while (alive().isNotEmpty()) {
-        val prev = states.put(state(), S(round, alive().map { it.c }))
-        if (prev != null) {
-            val skip = prev.collisions.zip(alive().map { it.c }).minOf { (p, c) -> (disappear - 1 - c) / (c - p) }
-            round += skip * (round - prev.round)
-            for ((g, p) in alive().zip(prev.collisions)) {
-                g.c += skip * (g.c - p)
-            }
-            states.clear()
-        }
-
-        var disappeared = false
-        val after = buildMap {
-            for (g in alive()) {
-                val n = g.move()
-                if (map[n] == '#') {
-                    g.d = g.d.turn90()
-                    g.c += 1
-                    if (g.c < disappear) {
-                        getOrPutIfMissing(g.p) { mutableListOf() }.add(g)
-                    } else {
-                        disappeared = true
-                    }
-                } else {
-                    g.p = n
-                    getOrPutIfMissing(g.p) { mutableListOf() }.add(g)
-                }
-            }
-        }
-        for ((_, ghosts) in after.filter { (_, ghosts) -> ghosts.size > 1 }) {
-            for (g in ghosts) {
-                g.d = g.d.turn180()
-                g.c += 1
-                if (g.c >= disappear)
-                    disappeared = true
-            }
-        }
-        round += 1
-
-        if (disappeared) {
-            states.clear()
-        }
-    }
-
-    return round
-}
+fun part3(notes: String, disappear: Long = 1_000_000_000_000): Long = Cave(notes, disappear).lastRound()
