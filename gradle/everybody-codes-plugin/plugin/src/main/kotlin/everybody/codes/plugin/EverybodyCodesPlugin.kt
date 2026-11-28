@@ -120,7 +120,7 @@ internal inline fun <reified T> HttpClient.downloadJson(uri: URI, output: Path) 
 
 abstract class ApiService : BuildService<Parameters>, AutoCloseable {
     private val client: HttpClient
-    val seed: Long
+    val user: User
 
     init {
         val cookieManager = CookieManager(null, CookiePolicy.ACCEPT_NONE).apply {
@@ -141,7 +141,7 @@ abstract class ApiService : BuildService<Parameters>, AutoCloseable {
         val response = client.send(request, HttpResponse.BodyHandlers.ofString())
         if (response.statusCode() !in 200..299)
             throw RuntimeException("failed to fetch seed")
-        seed = json.decodeFromString<User>(response.body()).seed
+        user = json.decodeFromString<User>(response.body())
     }
 
     fun fetchNotes(event: String, quest: String, seed: Long, output: Path) {
@@ -200,7 +200,6 @@ abstract class DownloadNotes : DefaultTask() {
 
 }
 
-@UntrackedTask(because = "Quest state can change on the website between builds")
 abstract class DownloadState : DefaultTask() {
 
     @get:ServiceReference("api")
@@ -212,8 +211,22 @@ abstract class DownloadState : DefaultTask() {
     @get:Input
     abstract val quest: Property<String>
 
+    @get:Input
+    abstract val accountId: Property<Long>
+
     @get:OutputFile
     abstract val stateFile: RegularFileProperty
+
+    internal fun hasAllKeys(): Boolean {
+        val file = stateFile.get().asFile
+        if (!file.isFile) return false
+        val state = try {
+            json.decodeFromString<Status>(file.readText())
+        } catch (_: SerializationException) {
+            return false
+        }
+        return state.key1 != null && state.key2 != null && state.key3 != null
+    }
 
     @TaskAction
     fun download() {
@@ -244,15 +257,23 @@ class EverybodyCodesPlugin : Plugin<Project> {
         val downloadNotes = project.tasks.register("downloadNotes", DownloadNotes::class.java) { task ->
             task.event.set(project.parent!!.name)
             task.quest.set(project.name)
-            task.seed.set(api.map { it.seed })
+            task.seed.set(api.map { it.user.seed })
             task.notesFile.set(project.layout.buildDirectory.file("everybody_codes/notes.json"))
         }
 
-        val downloadState = project.tasks.register("downloadState", DownloadState::class.java) { task ->
-            task.event.set(project.parent!!.name)
-            task.quest.set(project.name)
-            task.stateFile.set(project.layout.buildDirectory.file("everybody_codes/state.json"))
-        }
+        fun stateDownload(name: String, file: String) =
+            project.tasks.register(name, DownloadState::class.java) { task ->
+                task.event.set(project.parent!!.name)
+                task.quest.set(project.name)
+                task.accountId.set(api.map { it.user.id })
+                task.stateFile.set(project.layout.buildDirectory.file("everybody_codes/$file"))
+            }
+
+        val downloadState = stateDownload("downloadState", "state.json")
+        downloadState.configure { task -> task.outputs.upToDateWhen { task.hasAllKeys() } }
+
+        val submissionState = stateDownload("downloadSubmissionState", "submission-state.json")
+        submissionState.configure { it.doNotTrackState("Answers can be submitted on the website between builds") }
 
         val parts = (1..3).map { part ->
             val decrypted = project.layout.buildDirectory.file("everybody_codes/notes$part.txt")
@@ -276,18 +297,20 @@ class EverybodyCodesPlugin : Plugin<Project> {
         sourceSetMain.generatedKotlin.srcDir(generateMain)
 
         val run = project.tasks.register("run", JavaExec::class.java) { task ->
+
             task.classpath = project.files(
                 project.extensions.getByType(SourceSetContainer::class.java).getByName("main").runtimeClasspath
             )
             task.mainClass.set("MainKt")
             task.argumentProviders.addAll(parts)
             task.outputs.files(parts.map { it.answer })
+            task.outputs.upToDateWhen { false }
         }
 
         project.tasks.register("submit", Submit::class.java) { task ->
             task.dependsOn(run)
             parts.forEach { task.answerFiles.add(it.answer) }
-            task.statusFile.set(downloadState.flatMap { it.stateFile })
+            task.statusFile.set(submissionState.flatMap { it.stateFile })
         }
     }
 }

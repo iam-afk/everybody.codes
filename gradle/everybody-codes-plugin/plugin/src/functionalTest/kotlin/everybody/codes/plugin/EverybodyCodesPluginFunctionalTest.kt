@@ -85,6 +85,11 @@ class EverybodyCodesPluginFunctionalTest {
             assertEquals("solved: $text", answer.readText())
         }
 
+        val unchanged = runner.build()
+        assertEquals(SUCCESS, unchanged.task(":2026:1:run")?.outcome)
+        assertContains(unchanged.output, "called part1 solver")
+        assertEquals(UP_TO_DATE, unchanged.task(":2026:1:decryptNotes1")?.outcome)
+
         state.writeText("{}")
         val locked = runner.build()
         assertFalse(decrypted.exists(), "Locking part 1 should remove its decrypted notes")
@@ -94,25 +99,46 @@ class EverybodyCodesPluginFunctionalTest {
 
     @Test
     fun `submit selects the current part when reusing the configuration cache`() {
-        val files = createQuest().resolve("build/everybody_codes").apply { mkdirs() }
-        val state = files.resolve("state.json")
+        val quest = createQuest()
+        quest.resolve("build.gradle.kts").writeText(
+            """
+            import everybody.codes.plugin.DownloadState
+
+            tasks.named<DownloadState>("downloadSubmissionState") {
+                accountId.set(1L)
+                val remote = layout.projectDirectory.file("remote-state.json").asFile
+                val target = stateFile
+                actions.clear()
+                doLast { remote.copyTo(target.get().asFile, overwrite = true) }
+            }
+            """.trimIndent()
+        )
+        val remote = quest.resolve("remote-state.json")
+        val files = quest.resolve("build/everybody_codes")
+        val state = files.resolve("submission-state.json")
+        val stateTask = ":2026:1:downloadSubmissionState"
         val submit = runner(
             ":2026:1:submit", "-x", ":2026:1:run", "-x", ":2026:1:downloadState",
             "--configuration-cache", "--offline", "--info"
         )
 
-        state.writeText("""{"key1":"unlocked"}""")
-        assertContains(submit.build().output, "no answer found for part 1")
+        remote.writeText("""{"key1":"one","key2":"two","key3":"three"}""")
+        val first = submit.build()
+        assertEquals(SUCCESS, first.task(stateTask)?.outcome)
+        assertEquals(remote.readText(), state.readText())
+        assertContains(first.output, "no answer found for part 1")
 
         files.resolve("answer1.txt").writeText("already submitted")
-        state.writeText("""{"answer1":"already submitted","key2":"unlocked"}""")
+        remote.writeText("""{"key1":"one","key2":"two","key3":"three","answer1":"already submitted"}""")
         val second = submit.build()
+        assertEquals(SUCCESS, second.task(stateTask)?.outcome)
+        assertEquals(remote.readText(), state.readText())
         assertContains(second.output, "Configuration cache entry reused.")
         assertContains(second.output, "no answer found for part 2")
     }
 
     @Test
-    fun `notes follow the seed while state refreshes on every build`() {
+    fun `notes follow the seed while state polls until all keys are known for the account`() {
         val quest = createQuest()
         quest.resolve("build.gradle.kts").writeText(
             """
@@ -128,6 +154,7 @@ class EverybodyCodesPluginFunctionalTest {
                 doLast { target.get().asFile.writeText(remoteNotes.readText()) }
             }
             tasks.named<DownloadState>("downloadState") {
+                accountId.set(providers.gradleProperty("testAccountId").map { it.toLong() })
                 val target = stateFile
                 actions.clear()
                 doLast { target.get().asFile.writeText(remoteState.readText()) }
@@ -136,7 +163,8 @@ class EverybodyCodesPluginFunctionalTest {
         )
         val notesTask = ":2026:1:downloadNotes"
         val stateTask = ":2026:1:downloadState"
-        fun download(seed: Long) = runner(notesTask, stateTask, "-PtestSeed=$seed", "--offline").build()
+        fun download(seed: Long, accountId: Long = 1) =
+            runner(notesTask, stateTask, "-PtestSeed=$seed", "-PtestAccountId=$accountId", "--offline").build()
 
         val remoteNotes = quest.resolve("remote-notes.json")
         val remoteState = quest.resolve("remote-state.json")
@@ -151,14 +179,28 @@ class EverybodyCodesPluginFunctionalTest {
         assertEquals(remoteState.readText(), state.readText())
 
         remoteNotes.writeText("""{"1":"new"}""")
-        remoteState.writeText("""{"key1":"unlocked"}""")
+        remoteState.writeText("""{"key1":"one","key2":"two"}""")
         val sameSeed = download(1)
         assertEquals(UP_TO_DATE, sameSeed.task(notesTask)?.outcome)
         assertEquals(SUCCESS, sameSeed.task(stateTask)?.outcome)
         assertEquals("""{"1":"original notes"}""", notes.readText())
         assertEquals(remoteState.readText(), state.readText())
 
-        val newSeed = download(2)
+        remoteState.writeText("""{"key1":"one","key2":"two","key3":"three"}""")
+        val unlocked = download(1)
+        assertEquals(SUCCESS, unlocked.task(stateTask)?.outcome)
+        assertEquals(remoteState.readText(), state.readText())
+
+        val complete = download(1)
+        assertEquals(UP_TO_DATE, complete.task(stateTask)?.outcome)
+
+        remoteState.writeText("""{"key1":"other account"}""")
+        val newAccount = download(1, accountId = 2)
+        assertEquals(UP_TO_DATE, newAccount.task(notesTask)?.outcome)
+        assertEquals(SUCCESS, newAccount.task(stateTask)?.outcome)
+        assertEquals(remoteState.readText(), state.readText())
+
+        val newSeed = download(2, accountId = 2)
         assertEquals(SUCCESS, newSeed.task(notesTask)?.outcome)
         assertEquals(remoteNotes.readText(), notes.readText())
     }
